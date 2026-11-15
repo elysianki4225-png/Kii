@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Kii Stress — Soft UI Evolution 风格的轻量化 CPU / GPU 极限压力测试工具，支持多线程与 WebGPU/WebGL2 满载压测及自定义时长或持续运行。">
+  <meta name="theme-color" content="#EDF1F7">
+  <title>Kii Stress — CPU &amp; GPU 极限压力测试</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Compact Top Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none">
+            <rect x="6" y="6" width="20" height="20" rx="6" stroke="url(#kiiGrad)" stroke-width="2.2"/>
+            <path d="M10.5 17.5L13.5 12.2L16.8 19.6L19.8 14.5L21.6 16.5" stroke="url(#kiiGrad)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <defs>
+              <linearGradient id="kiiGrad" x1="6" y1="6" x2="26" y2="26" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#2F6FED"/>
+                <stop offset="1" stop-color="#0EA58C"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1 data-i18n="appTitle">Kii Stress</h1>
+          <p data-i18n="appSubtitle">CPU / GPU 极限压力测试</p>
+        </div>
+      </div>
+
+      <div class="header-meta">
+        <div class="hw-pill" id="hwCpuPill">
+          <span class="pill-dot pill-dot-cpu"></span>
+          <span id="hwCpuText">--</span>
+        </div>
+        <div class="hw-pill" id="hwGpuPill">
+          <span class="pill-dot pill-dot-gpu"></span>
+          <span id="hwGpuText">--</span>
+        </div>
+        <span class="wake-pill hidden" id="wakeLockPill" data-i18n="wakeLockActive">防休眠已开启</span>
+        <button type="button" class="soft-icon-btn" id="langToggleBtn" aria-label="Switch Language">EN</button>
+        <button type="button" class="esc-pill" id="escStopBtn" title="ESC">
+          <kbd>ESC</kbd>
+          <span data-i18n="escHint">紧急停止</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Session Timer & Master Controls -->
+    <section class="soft-card session-bar" aria-label="Session Controls">
+      <div class="session-duration">
+        <div class="field-label-row">
+          <span class="field-label" data-i18n="durationLabel">测试时长</span>
+          <span class="timer-state-tag" id="timerStateTag" data-i18n="timerReady">就绪</span>
+        </div>
+
+        <div class="segmented-track duration-presets" role="group" aria-label="Duration Presets">
+          <button type="button" class="seg-btn" data-duration="60" data-i18n="preset1m">1 分钟</button>
+          <button type="button" class="seg-btn" data-duration="300" data-i18n="preset5m">5 分钟</button>
+          <button type="button" class="seg-btn" data-duration="900" data-i18n="preset15m">15 分钟</button>
+          <button type="button" class="seg-btn" data-duration="1800" data-i18n="preset30m">30 分钟</button>
+          <button type="button" class="seg-btn" data-duration="3600" data-i18n="preset60m">60 分钟</button>
+          <button type="button" class="seg-btn is-active" data-duration="0" data-i18n="presetInfinite">∞ 持续运行</button>
+          <button type="button" class="seg-btn" data-duration="custom" data-i18n="presetCustom">自定义</button>
+        </div>
+
+        <div class="custom-duration-row hidden" id="customDurationRow">
+          <div class="custom-input-well">
+            <input type="number" id="customMinutesInput" min="0" max="1440" value="10" inputmode="numeric" aria-label="Minutes">
+            <span data-i18n="customMin">分</span>
+          </div>
+          <div class="custom-input-well">
+            <input type="number" id="customSecondsInput" min="0" max="59" value="0" inputmode="numeric" aria-label="Seconds">
+            <span data-i18n="customSec">秒</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="session-right">
+        <div class="timer-readout-well">
+          <div class="timer-digits" id="timerDisplay">∞</div>
+          <div class="timer-progress-track" id="timerProgressTrack">
+            <div class="timer-progress-fill" id="timerProgressFill"></div>
+          </div>
+        </div>
+
+        <button type="button" class="master-btn" id="masterToggleBtn">
+          <span class="btn-indicator" aria-hidden="true"></span>
+          <span id="masterToggleLabel" data-i18n="startAll">启动双烤 (CPU + GPU)</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- Main 2-Column Workstation -->
+    <main class="workstation-grid">
+      <!-- CPU Stress Panel -->
+      <section class="soft-card module-card" id="cpuCard" aria-label="CPU Stress Test">
+        <div class="module-header">
+          <div class="module-title-wrap">
+            <span class="status-led" id="cpuLed"></span>
+            <div>
+              <h2 data-i18n="cpuTitle">CPU 压力测试</h2>
+              <span class="module-status-text" id="cpuStatusText" data-i18n="statusIdle">空闲</span>
+            </div>
+          </div>
+          <button type="button" class="module-toggle-btn module-toggle-cpu" id="cpuToggleBtn">
+            <span id="cpuToggleLabel" data-i18n="start">启动</span>
+          </button>
+        </div>
+
+        <!-- CPU Live Telemetry -->
+        <div class="telemetry-row">
+          <div class="soft-well stat-well">
+            <span class="stat-label" data-i18n="cpuThroughput">实时算力</span>
+            <div class="stat-value accent-cpu">
+              <span id="cpuRateVal">0.0</span>
+              <span class="stat-unit" id="cpuRateUnit">MOPS</span>
+            </div>
+            <span class="stat-sub">
+              <span data-i18n="cpuPeak">峰值</span>:
+              <strong id="cpuPeakVal">0.0</strong>
+            </span>
+          </div>
+
+          <div class="soft-well stat-well">
+            <span class="stat-label" data-i18n="cpuActiveThreads">活跃线程</span>
+            <div class="stat-value">
+              <span id="cpuActiveVal">0</span>
+              <span class="stat-unit" id="cpuTargetThreadsUnit">/ 8</span>
+            </div>
+            <span class="stat-sub" id="cpuKernelBadge" data-i18n="workloadExtreme">极限混合</span>
+          </div>
+
+          <div class="soft-well stat-well">
+            <span class="stat-label" data-i18n="cpuDutyActual">Worker 饱和度</span>
+            <div class="stat-value">
+              <span id="cpuSatVal">0</span>
+              <span class="stat-unit">%</span>
+            </div>
+            <span class="stat-sub" id="cpuDutySub">100%</span>
+          </div>
+        </div>
+
+        <!-- CPU Live Sparkline -->
+        <div class="soft-well sparkline-well">
+          <canvas id="cpuSparkline" aria-label="CPU Throughput Chart"></canvas>
+        </div>
+
+        <hr class="soft-divider">
+
+        <!-- CPU Controls -->
+        <div class="control-stack">
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="cpuThreadsSlider" class="field-label" data-i18n="cpuThreadsLabel">并发线程数</label>
+              <div class="thread-value-controls">
+                <div class="quick-chips" id="cpuThreadChips">
+                  <button type="button" class="chip-btn" data-mult="1">1×</button>
+                  <button type="button" class="chip-btn" data-mult="1.5">1.5×</button>
+                  <button type="button" class="chip-btn" data-mult="2">2×</button>
+                  <button type="button" class="chip-btn" data-abs="64">64</button>
+                </div>
+                <div class="num-pill">
+                  <input type="number" id="cpuThreadsInput" min="1" max="256" value="8" inputmode="numeric" aria-label="Thread count">
+                </div>
+              </div>
+            </div>
+            <input type="range" id="cpuThreadsSlider" class="soft-slider slider-cpu" min="1" max="64" value="8">
+            <p class="control-hint" id="cpuThreadsHint"></p>
+          </div>
+
+          <div class="control-group">
+            <span class="field-label" data-i18n="cpuWorkloadLabel">计算内核</span>
+            <div class="segmented-track" id="cpuWorkloadGroup" role="group">
+              <button type="button" class="seg-btn is-active" data-workload="extreme" data-i18n="workloadExtreme">极限混合</button>
+              <button type="button" class="seg-btn" data-workload="fp64" data-i18n="workloadFp64">浮点矩阵</button>
+              <button type="button" class="seg-btn" data-workload="crypto" data-i18n="workloadCrypto">整数哈希</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <span class="field-label" data-i18n="cpuDutyLabel">负载占空比</span>
+            <div class="segmented-track" id="cpuDutyGroup" role="group">
+              <button type="button" class="seg-btn is-active" data-duty="1" data-i18n="duty100">100% 满载</button>
+              <button type="button" class="seg-btn" data-duty="0.75" data-i18n="duty75">75%</button>
+              <button type="button" class="seg-btn" data-duty="0.5" data-i18n="duty50">50%</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- GPU Stress Panel -->
+      <section class="soft-card module-card" id="gpuCard" aria-label="GPU Stress Test">
+        <div class="module-header">
+          <div class="module-title-wrap">
+            <span class="status-led" id="gpuLed"></span>
+            <div>
+              <h2 data-i18n="gpuTitle">GPU 压力测试</h2>
+              <span class="module-status-text" id="gpuStatusText" data-i18n="statusIdle">空闲</span>
+            </div>
+          </div>
+          <button type="button" class="module-toggle-btn module-toggle-gpu" id="gpuToggleBtn">
+            <span id="gpuToggleLabel" data-i18n="start">启动</span>
+          </button>
+        </div>
+
+        <!-- GPU Live Viewport -->
+        <div class="soft-well gpu-viewport" id="gpuViewport">
+          <canvas id="webgpuCanvas" class="gpu-canvas hidden" aria-label="WebGPU Stress Output"></canvas>
+          <canvas id="webglCanvas" class="gpu-canvas hidden" aria-label="WebGL2 Stress Output"></canvas>
+          <div class="gpu-viewport-overlay" id="gpuOverlay">
+            <span class="gpu-overlay-text" id="gpuOverlayText" data-i18n="gpuIdleText">GPU 就绪 · 点击启动开始极限压测</span>
+          </div>
+          <button type="button" class="viewport-pill-btn" id="gpuPreviewToggleBtn" data-i18n="gpuHidePreview">纯算力模式</button>
+        </div>
+
+        <!-- GPU Live Telemetry -->
+        <div class="telemetry-row">
+          <div class="soft-well stat-well">
+            <span class="stat-label" data-i18n="gpuThroughput">估算算力</span>
+            <div class="stat-value accent-gpu">
+              <span id="gpuThroughputVal">0.0</span>
+              <span class="stat-unit" id="gpuThroughputUnit">GFLOP/s</span>
+            </div>
+            <span class="stat-sub" id="gpuSpecVal">--</span>
+          </div>
+
+          <div class="soft-well stat-well">
+            <span class="stat-label" data-i18n="gpuFrameRate">提交速率</span>
+            <div class="stat-value">
+              <span id="gpuRateVal">0.0</span>
+              <span class="stat-unit" id="gpuRateUnit">批/秒</span>
+            </div>
+            <span class="stat-sub" id="gpuEngineBadge">--</span>
+          </div>
+
+          <div class="soft-well stat-well">
+            <span class="stat-label" data-i18n="gpuBatchTime">单批耗时</span>
+            <div class="stat-value">
+              <span id="gpuBatchMsVal">0.0</span>
+              <span class="stat-unit">ms</span>
+            </div>
+            <span class="stat-sub" id="gpuModeBadge" data-i18n="presetAuto">自适应满载</span>
+          </div>
+        </div>
+
+        <hr class="soft-divider">
+
+        <!-- GPU Controls -->
+        <div class="control-stack">
+          <div class="control-group">
+            <span class="field-label" data-i18n="gpuEngineLabel">计算后端</span>
+            <div class="segmented-track" id="gpuEngineGroup" role="group">
+              <button type="button" class="seg-btn" data-engine="webgpu" id="btnEngineWebgpu" data-i18n="gpuEngineWebgpu">WebGPU 计算</button>
+              <button type="button" class="seg-btn is-active" data-engine="webgl2" id="btnEngineWebgl2" data-i18n="gpuEngineWebgl2">WebGL2 离屏</button>
+            </div>
+            <p class="control-hint hidden" id="gpuEngineHint"></p>
+          </div>
+
+          <div class="control-group">
+            <span class="field-label" data-i18n="gpuPresetLabel">极限档位</span>
+            <div class="segmented-track" id="gpuPresetGroup" role="group">
+              <button type="button" class="seg-btn is-active" data-preset="auto" data-i18n="presetAuto">自适应满载</button>
+              <button type="button" class="seg-btn" data-preset="high" data-i18n="presetHigh">高负载</button>
+              <button type="button" class="seg-btn" data-preset="extreme" data-i18n="presetExtreme">极限</button>
+              <button type="button" class="seg-btn" data-preset="overdrive" data-i18n="presetOverdrive">狂暴超载</button>
+            </div>
+            <p class="control-hint warning-hint hidden" id="gpuOverdriveHint" data-i18n="gpuOverdriveNotice"></p>
+          </div>
+
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="gpuScaleSlider" class="field-label" data-i18n="gpuScaleLabel">负载倍率</label>
+              <span class="scale-readout" id="gpuScaleReadout">4×</span>
+            </div>
+            <input type="range" id="gpuScaleSlider" class="soft-slider slider-gpu" min="1" max="16" step="1" value="4">
+            <label class="soft-checkbox-row" for="gpuUncapCheckbox">
+              <input type="checkbox" id="gpuUncapCheckbox" checked>
+              <span class="soft-checkbox-box" aria-hidden="true"></span>
+              <span class="soft-checkbox-text" data-i18n="gpuUncapLabel">解除 VSync 帧率上限（持续压满队列）</span>
+            </label>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Post-Session Summary Strip (shown cleanly after a test finishes) -->
+    <section class="soft-card summary-strip hidden" id="summaryStrip" aria-live="polite">
+      <div class="summary-content">
+        <strong class="summary-title" data-i18n="summaryTitle">本次测试摘要</strong>
+        <div class="summary-metrics">
+          <div class="summary-item">
+            <span data-i18n="summaryDuration">总计耗时</span>
+            <strong id="summaryDurationVal">--</strong>
+          </div>
+          <div class="summary-item" id="summaryCpuItem">
+            <span data-i18n="summaryCpuAvg">CPU 平均 / 峰值</span>
+            <strong id="summaryCpuVal">--</strong>
+          </div>
+          <div class="summary-item" id="summaryGpuItem">
+            <span data-i18n="summaryGpuAvg">GPU 平均吞吐</span>
+            <strong id="summaryGpuVal">--</strong>
+          </div>
+        </div>
+      </div>
+      <button type="button" class="soft-icon-btn" id="summaryDismissBtn" data-i18n="summaryDismiss">关闭</button>
+    </section>
+
+    <!-- Inline Error Toast (only when GPU context lost or unsupported) -->
+    <div class="soft-card error-banner hidden" id="errorBanner" role="alert">
+      <span id="errorBannerText"></span>
+      <button type="button" class="soft-icon-btn" id="errorDismissBtn">×</button>
+    </div>
+
+    <footer class="app-footer">
+      <p data-i18n="footerNotice">提示：极限满载会导致 CPU/GPU 高发热与风扇全速运转，请确保散热良好并接通电源；随时按 ESC 可立即停止。</p>
+    </footer>
+  </div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
