@@ -1,13 +1,14 @@
 import { I18N } from './i18n.js';
 import { CpuStressEngine } from './cpu-stress.js';
 import { GpuStressEngine } from './gpu-stress.js';
+import { RamStressEngine } from './ram-stress.js';
 import { Sparkline } from './sparkline.js';
 
 const detectedCores = Math.max(1, navigator.hardwareConcurrency || 8);
+const detectedDeviceMemGB = typeof navigator.deviceMemory === 'number' ? navigator.deviceMemory : null;
 
 const state = {
   lang: 'zh',
-  // Duration: 0 = infinite continuous, >0 = timed seconds
   durationPreset: '0', // '60' | '300' | '900' | '1800' | '3600' | '0' | 'custom'
   customMinutes: 10,
   customSeconds: 0,
@@ -15,32 +16,43 @@ const state = {
   // Session runtime
   sessionActive: false,
   sessionStartMs: 0,
-  sessionTargetSec: 0, // 0 means continuous
+  sessionTargetSec: 0,
   ranCpuInSession: false,
   ranGpuInSession: false,
+  ranRamInSession: false,
   timerInterval: null,
   wakeLock: null,
 
   // CPU config
   cpuThreads: detectedCores,
-  cpuWorkload: 'extreme',
+  cpuWorkload: 'simd',
   cpuDuty: 1.0,
 
   // GPU config
   gpuEngine: 'webgl2',
   gpuPreset: 'auto',
-  gpuScale: 4,
+  gpuScale: 8,
   gpuUncap: true,
+  gpuDualPipe: true,
   gpuShowPreview: true,
-  gpuHasError: false
+  gpuHasError: false,
+
+  // RAM config
+  ramTargetMB: 2048,
+  ramMode: 'bandwidth',
+  ramThreads: Math.max(2, Math.min(16, detectedCores)),
+  ramAllocating: false,
+  ramOomHit: false,
+  ramAllocatedMB: 0,
+  ramErrors: 0
 };
 
-// DOM References
 const $ = (id) => document.getElementById(id);
 
 const els = {
   hwCpuText: $('hwCpuText'),
   hwGpuText: $('hwGpuText'),
+  hwRamText: $('hwRamText'),
   wakeLockPill: $('wakeLockPill'),
   langToggleBtn: $('langToggleBtn'),
   escStopBtn: $('escStopBtn'),
@@ -55,6 +67,7 @@ const els = {
   masterToggleBtn: $('masterToggleBtn'),
   masterToggleLabel: $('masterToggleLabel'),
 
+  // CPU
   cpuCard: $('cpuCard'),
   cpuLed: $('cpuLed'),
   cpuStatusText: $('cpuStatusText'),
@@ -76,6 +89,7 @@ const els = {
   cpuWorkloadBtns: Array.from(document.querySelectorAll('#cpuWorkloadGroup .seg-btn')),
   cpuDutyBtns: Array.from(document.querySelectorAll('#cpuDutyGroup .seg-btn')),
 
+  // GPU
   gpuCard: $('gpuCard'),
   gpuLed: $('gpuLed'),
   gpuStatusText: $('gpuStatusText'),
@@ -103,13 +117,40 @@ const els = {
   gpuScaleSlider: $('gpuScaleSlider'),
   gpuScaleReadout: $('gpuScaleReadout'),
   gpuUncapCheckbox: $('gpuUncapCheckbox'),
+  gpuDualPipeRow: $('gpuDualPipeRow'),
+  gpuDualPipeCheckbox: $('gpuDualPipeCheckbox'),
 
+  // RAM
+  ramCard: $('ramCard'),
+  ramLed: $('ramLed'),
+  ramStatusText: $('ramStatusText'),
+  ramToggleBtn: $('ramToggleBtn'),
+  ramToggleLabel: $('ramToggleLabel'),
+  ramBwVal: $('ramBwVal'),
+  ramPeakVal: $('ramPeakVal'),
+  ramAllocVal: $('ramAllocVal'),
+  ramAllocUnit: $('ramAllocUnit'),
+  ramTargetSub: $('ramTargetSub'),
+  ramPassesVal: $('ramPassesVal'),
+  ramErrorsSub: $('ramErrorsSub'),
+  ramSparkline: $('ramSparkline'),
+  ramSizeReadout: $('ramSizeReadout'),
+  ramSizePresetBtns: Array.from(document.querySelectorAll('#ramSizePresetGroup .seg-btn')),
+  ramSizeSlider: $('ramSizeSlider'),
+  ramModeBtns: Array.from(document.querySelectorAll('#ramModeGroup .seg-btn')),
+  ramThreadsSlider: $('ramThreadsSlider'),
+  ramThreadsReadout: $('ramThreadsReadout'),
+  ramOomHint: $('ramOomHint'),
+
+  // Summary & Error
   summaryStrip: $('summaryStrip'),
   summaryDurationVal: $('summaryDurationVal'),
   summaryCpuItem: $('summaryCpuItem'),
   summaryCpuVal: $('summaryCpuVal'),
   summaryGpuItem: $('summaryGpuItem'),
   summaryGpuVal: $('summaryGpuVal'),
+  summaryRamItem: $('summaryRamItem'),
+  summaryRamVal: $('summaryRamVal'),
   summaryDismissBtn: $('summaryDismissBtn'),
 
   errorBanner: $('errorBanner'),
@@ -127,10 +168,17 @@ function formatDuration(totalSec) {
   const mins = Math.floor((s % 3600) / 60);
   const secs = s % 60;
   const pad = (n) => String(n).padStart(2, '0');
-  if (hrs > 0) {
-    return `${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
+  return hrs > 0 ? `${pad(hrs)}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
+}
+
+function formatCpuRate(opsPerSec, workload) {
+  if (workload === 'crypto') {
+    return { val: (opsPerSec / 1e6).toFixed(2), unit: t('unitMh') };
   }
-  return `${pad(mins)}:${pad(secs)}`;
+  if (opsPerSec >= 1e9 || workload === 'simd') {
+    return { val: (opsPerSec / 1e9).toFixed(1), unit: t('unitGflops') };
+  }
+  return { val: (opsPerSec / 1e6).toFixed(1), unit: t('unitMops') };
 }
 
 function formatGflops(gflops) {
@@ -138,6 +186,16 @@ function formatGflops(gflops) {
     return { val: (gflops / 1000).toFixed(2), unit: t('unitTflops') };
   }
   return { val: gflops.toFixed(1), unit: t('unitGflops') };
+}
+
+function formatMemoryMB(mb) {
+  if (mb >= 1024) {
+    const gb = mb / 1024;
+    const val = Number.isInteger(gb) ? gb.toFixed(1) : gb.toFixed(2);
+    return { val, unit: 'GB', text: `${val} GB` };
+  }
+  const val = String(Math.round(mb));
+  return { val, unit: 'MB', text: `${val} MB` };
 }
 
 function updateSliderFill(slider) {
@@ -158,7 +216,7 @@ function getSelectedDurationSec() {
   return Math.max(0, parseInt(state.durationPreset, 10) || 0);
 }
 
-// ==================== Engines & Sparkline ====================
+// ==================== Engines & Sparklines ====================
 const cpuSparkline = new Sparkline(els.cpuSparkline, {
   maxPoints: 48,
   strokeColor: '#2F6FED',
@@ -166,15 +224,23 @@ const cpuSparkline = new Sparkline(els.cpuSparkline, {
   fillBottom: 'rgba(47, 111, 237, 0.0)'
 });
 
+const ramSparkline = new Sparkline(els.ramSparkline, {
+  maxPoints: 48,
+  strokeColor: '#5B64EC',
+  fillTop: 'rgba(91, 100, 236, 0.2)',
+  fillBottom: 'rgba(91, 100, 236, 0.0)'
+});
+
 const cpuEngine = new CpuStressEngine((stats) => {
-  const unit = stats.workload === 'crypto' ? t('unitMh') : t('unitMops');
-  els.cpuRateVal.textContent = stats.rateMillions.toFixed(1);
-  els.cpuRateUnit.textContent = unit;
-  els.cpuPeakVal.textContent = `${stats.peakMillions.toFixed(1)} ${unit}`;
+  const cur = formatCpuRate(stats.rateOps, stats.workload);
+  const peak = formatCpuRate(stats.peakOps, stats.workload);
+  els.cpuRateVal.textContent = cur.val;
+  els.cpuRateUnit.textContent = cur.unit;
+  els.cpuPeakVal.textContent = `${peak.val} ${peak.unit}`;
   els.cpuActiveVal.textContent = String(stats.activeWorkers);
   els.cpuTargetThreadsUnit.textContent = `/ ${state.cpuThreads}`;
   els.cpuSatVal.textContent = Math.round(stats.saturationPct).toString();
-  cpuSparkline.push(stats.rateMillions);
+  cpuSparkline.push(stats.rateOps / 1e6);
 });
 
 const gpuEngine = new GpuStressEngine(
@@ -199,6 +265,44 @@ const gpuEngine = new GpuStressEngine(
   }
 );
 
+const ramEngine = new RamStressEngine((stats) => {
+  state.ramAllocating = stats.allocating;
+  state.ramOomHit = stats.oomHit;
+  state.ramAllocatedMB = stats.allocatedMB;
+  state.ramErrors = stats.errors;
+
+  els.ramBwVal.textContent = stats.gbs.toFixed(1);
+  els.ramPeakVal.textContent = `${stats.peakGBs.toFixed(1)} ${t('unitGbs')}`;
+
+  const allocFmt = formatMemoryMB(stats.allocatedMB);
+  els.ramAllocVal.textContent = allocFmt.val;
+  els.ramAllocUnit.textContent = allocFmt.unit;
+  els.ramPassesVal.textContent = String(stats.passes);
+
+  if (stats.errors > 0) {
+    els.ramErrorsSub.textContent = t('ramErrorsFound').replace('{n}', String(stats.errors));
+    els.ramErrorsSub.classList.add('ram-error-alert');
+  } else if (stats.verifiedGB > 0.05) {
+    els.ramErrorsSub.textContent = `${t('ramErrorsZero')} · ${t('ramVerifiedTotal')} ${stats.verifiedGB.toFixed(1)} GB`;
+    els.ramErrorsSub.classList.remove('ram-error-alert');
+  } else {
+    els.ramErrorsSub.textContent = t('ramErrorsZero');
+    els.ramErrorsSub.classList.remove('ram-error-alert');
+  }
+
+  if (stats.oomHit) {
+    els.ramOomHint.textContent = t('ramOomNotice').replace('{mb}', String(Math.round(stats.allocatedMB)));
+    els.ramOomHint.classList.remove('hidden');
+  } else {
+    els.ramOomHint.classList.add('hidden');
+  }
+
+  if (!stats.allocating) {
+    ramSparkline.push(stats.gbs);
+  }
+  syncUIState();
+});
+
 // ==================== Wake Lock ====================
 async function requestWakeLock() {
   if (!('wakeLock' in navigator) || state.wakeLock) return;
@@ -209,9 +313,7 @@ async function requestWakeLock() {
       state.wakeLock = null;
       els.wakeLockPill.classList.add('hidden');
     });
-  } catch (_) {
-    // Ignore silently when unsupported or blocked
-  }
+  } catch (_) {}
 }
 
 async function releaseWakeLock() {
@@ -237,6 +339,7 @@ function beginSessionIfNeeded() {
   state.sessionTargetSec = getSelectedDurationSec();
   state.ranCpuInSession = cpuEngine.running;
   state.ranGpuInSession = gpuEngine.running;
+  state.ranRamInSession = ramEngine.running;
   els.summaryStrip.classList.add('hidden');
 
   requestWakeLock();
@@ -274,11 +377,7 @@ function tickSessionTimer() {
 function updateIdleTimerPreview() {
   if (state.sessionActive) return;
   const target = getSelectedDurationSec();
-  if (target > 0) {
-    els.timerDisplay.textContent = formatDuration(target);
-  } else {
-    els.timerDisplay.textContent = '∞';
-  }
+  els.timerDisplay.textContent = target > 0 ? formatDuration(target) : '∞';
   els.timerProgressFill.classList.remove('is-continuous');
   els.timerProgressFill.style.width = '0%';
   els.timerStateTag.textContent = t('timerReady');
@@ -287,7 +386,7 @@ function updateIdleTimerPreview() {
 
 function checkSessionAutoEnd(completedByTimer = false) {
   if (!state.sessionActive) return;
-  if (cpuEngine.running || gpuEngine.running) return;
+  if (cpuEngine.running || gpuEngine.running || ramEngine.running) return;
 
   const elapsedSec = (performance.now() - state.sessionStartMs) / 1000;
   state.sessionActive = false;
@@ -307,7 +406,7 @@ function checkSessionAutoEnd(completedByTimer = false) {
     updateIdleTimerPreview();
   }
 
-  if (elapsedSec >= 1.0 && (state.ranCpuInSession || state.ranGpuInSession)) {
+  if (elapsedSec >= 1.0 && (state.ranCpuInSession || state.ranGpuInSession || state.ranRamInSession)) {
     renderSummary(elapsedSec);
   }
 }
@@ -317,8 +416,9 @@ function renderSummary(elapsedSec) {
 
   if (state.ranCpuInSession) {
     const cpuSum = cpuEngine.getSummary();
-    const unit = cpuSum.workload === 'crypto' ? t('unitMh') : t('unitMops');
-    els.summaryCpuVal.textContent = `${cpuSum.avgMillions.toFixed(1)} / ${cpuSum.peakMillions.toFixed(1)} ${unit}`;
+    const avg = formatCpuRate(cpuSum.avgOps, cpuSum.workload);
+    const peak = formatCpuRate(cpuSum.peakOps, cpuSum.workload);
+    els.summaryCpuVal.textContent = `${avg.val} / ${peak.val} ${peak.unit}`;
     els.summaryCpuItem.classList.remove('hidden');
   } else {
     els.summaryCpuItem.classList.add('hidden');
@@ -333,6 +433,18 @@ function renderSummary(elapsedSec) {
     els.summaryGpuItem.classList.add('hidden');
   }
 
+  if (state.ranRamInSession) {
+    const ramSum = ramEngine.getSummary();
+    const errText =
+      ramSum.errors > 0
+        ? t('ramErrorsFound').replace('{n}', String(ramSum.errors))
+        : t('ramErrorsZero');
+    els.summaryRamVal.textContent = `${ramSum.avgGBs.toFixed(1)} ${t('unitGbs')} · ${errText}`;
+    els.summaryRamItem.classList.remove('hidden');
+  } else {
+    els.summaryRamItem.classList.add('hidden');
+  }
+
   els.summaryStrip.classList.remove('hidden');
 }
 
@@ -344,11 +456,8 @@ function startCpu() {
     workload: state.cpuWorkload,
     duty: state.cpuDuty
   });
-  if (state.sessionActive) {
-    state.ranCpuInSession = true;
-  } else {
-    beginSessionIfNeeded();
-  }
+  if (state.sessionActive) state.ranCpuInSession = true;
+  else beginSessionIfNeeded();
   syncUIState();
 }
 
@@ -373,13 +482,11 @@ function startGpu() {
     preset: state.gpuPreset,
     scale: state.gpuScale,
     uncapVsync: state.gpuUncap,
+    dualPipeline: state.gpuDualPipe,
     showPreview: state.gpuShowPreview
   });
-  if (state.sessionActive) {
-    state.ranGpuInSession = true;
-  } else {
-    beginSessionIfNeeded();
-  }
+  if (state.sessionActive) state.ranGpuInSession = true;
+  else beginSessionIfNeeded();
   syncUIState();
 }
 
@@ -393,11 +500,44 @@ function stopGpu() {
   checkSessionAutoEnd(false);
 }
 
+function startRam() {
+  ramSparkline.reset();
+  state.ramAllocating = true;
+  state.ramOomHit = false;
+  state.ramAllocatedMB = 0;
+  state.ramErrors = 0;
+  els.ramOomHint.classList.add('hidden');
+  els.ramErrorsSub.classList.remove('ram-error-alert');
+  els.ramErrorsSub.textContent = t('ramErrorsZero');
+
+  ramEngine.start({
+    targetMB: state.ramTargetMB,
+    mode: state.ramMode,
+    threads: state.ramThreads
+  });
+  if (state.sessionActive) state.ranRamInSession = true;
+  else beginSessionIfNeeded();
+  syncUIState();
+}
+
+function stopRam() {
+  ramEngine.stop();
+  state.ramAllocating = false;
+  state.ramAllocatedMB = 0;
+  els.ramBwVal.textContent = '0.0';
+  els.ramAllocVal.textContent = '0';
+  els.ramAllocUnit.textContent = 'MB';
+  els.ramPassesVal.textContent = '0';
+  syncUIState();
+  checkSessionAutoEnd(false);
+}
+
 function startAll() {
   if (!cpuEngine.running) startCpu();
   if (!gpuEngine.running && (gpuEngine.capabilities.webgpu || gpuEngine.capabilities.webgl2)) {
     startGpu();
   }
+  if (!ramEngine.running) startRam();
   syncUIState();
 }
 
@@ -414,6 +554,15 @@ function stopAll(completedByTimer = false) {
     els.gpuRateVal.textContent = '0.0';
     els.gpuBatchMsVal.textContent = '0.0';
     els.gpuSpecVal.textContent = '--';
+  }
+  if (ramEngine.running) {
+    ramEngine.stop();
+    state.ramAllocating = false;
+    state.ramAllocatedMB = 0;
+    els.ramBwVal.textContent = '0.0';
+    els.ramAllocVal.textContent = '0';
+    els.ramAllocUnit.textContent = 'MB';
+    els.ramPassesVal.textContent = '0';
   }
   syncUIState();
   checkSessionAutoEnd(completedByTimer);
@@ -455,7 +604,8 @@ function syncGpuCanvasVisibility() {
 function syncUIState() {
   const cpuOn = cpuEngine.running;
   const gpuOn = gpuEngine.running;
-  const anyOn = cpuOn || gpuOn;
+  const ramOn = ramEngine.running;
+  const anyOn = cpuOn || gpuOn || ramOn;
 
   // Master button
   els.masterToggleBtn.classList.toggle('is-running', anyOn);
@@ -468,16 +618,21 @@ function syncUIState() {
   els.cpuToggleBtn.classList.toggle('is-running', cpuOn);
   els.cpuToggleLabel.textContent = cpuOn ? t('stop') : t('start');
   els.cpuTargetThreadsUnit.textContent = `/ ${state.cpuThreads}`;
-  els.cpuRateUnit.textContent = state.cpuWorkload === 'crypto' ? t('unitMh') : t('unitMops');
   els.cpuDutySub.textContent = `${Math.round(state.cpuDuty * 100)}%`;
 
-  const kernelKey =
-    state.cpuWorkload === 'fp64'
-      ? 'workloadFp64'
-      : state.cpuWorkload === 'crypto'
-        ? 'workloadCrypto'
-        : 'workloadExtreme';
-  els.cpuKernelBadge.textContent = t(kernelKey);
+  if (state.cpuWorkload === 'simd') {
+    els.cpuKernelBadge.textContent = cpuEngine.simdSupported ? t('cpuSimdActive') : t('cpuJsFallback');
+    if (!cpuOn) els.cpuRateUnit.textContent = t('unitGflops');
+  } else if (state.cpuWorkload === 'fp64') {
+    els.cpuKernelBadge.textContent = t('workloadFp64');
+    if (!cpuOn) els.cpuRateUnit.textContent = t('unitGflops');
+  } else if (state.cpuWorkload === 'crypto') {
+    els.cpuKernelBadge.textContent = t('workloadCrypto');
+    if (!cpuOn) els.cpuRateUnit.textContent = t('unitMh');
+  } else {
+    els.cpuKernelBadge.textContent = t('workloadExtreme');
+    if (!cpuOn) els.cpuRateUnit.textContent = t('unitMops');
+  }
 
   // GPU module
   els.gpuCard.classList.toggle('is-running-gpu', gpuOn);
@@ -502,6 +657,27 @@ function syncUIState() {
   els.gpuModeBadge.textContent = t(presetKeyMap[state.gpuPreset] || 'presetAuto');
   els.gpuOverdriveHint.classList.toggle('hidden', state.gpuPreset !== 'overdrive');
   els.gpuScaleReadout.textContent = `${state.gpuScale}×`;
+  els.gpuDualPipeRow.classList.toggle('hidden', state.gpuEngine !== 'webgpu');
+
+  // RAM module
+  els.ramCard.classList.toggle('is-running-ram', ramOn);
+  if (state.ramErrors > 0) {
+    els.ramLed.className = 'status-led is-error';
+  } else {
+    els.ramLed.className = ramOn ? 'status-led is-ram-on' : 'status-led';
+  }
+  els.ramStatusText.textContent = !ramOn
+    ? t('statusIdle')
+    : state.ramAllocating
+      ? t('statusAllocating')
+      : t('statusRunning');
+  els.ramToggleBtn.classList.toggle('is-running', ramOn);
+  els.ramToggleLabel.textContent = ramOn ? t('stop') : t('start');
+
+  const targetFmt = formatMemoryMB(state.ramTargetMB);
+  els.ramSizeReadout.textContent = targetFmt.text;
+  els.ramTargetSub.textContent = targetFmt.text;
+  els.ramThreadsReadout.textContent = String(state.ramThreads);
 
   syncGpuCanvasVisibility();
 }
@@ -512,20 +688,21 @@ function applyLanguage() {
 
   document.querySelectorAll('[data-i18n]').forEach((el) => {
     const key = el.getAttribute('data-i18n');
-    if (key) {
-      el.textContent = t(key);
-    }
+    if (key) el.textContent = t(key);
   });
 
-  // Dynamic interpolated texts
-  els.hwCpuText.textContent = `${detectedCores} ${t('logicalCores')}`;
+  els.hwCpuText.textContent = `${detectedCores} ${t('logicalCores')}${cpuEngine.simdSupported ? ' · SIMD128' : ''}`;
   els.cpuThreadsHint.textContent = t('cpuThreadsHint').replace('{cores}', String(detectedCores));
 
   const caps = gpuEngine.capabilities;
-  const backendTag = caps.webgpu ? 'WebGPU' : caps.webgl2 ? 'WebGL2' : 'N/A';
+  const backendTag = caps.webgpu ? 'WebGPU' : caps.webgl2 ? `WebGL2 ${caps.mrtCount}MRT` : 'N/A';
   els.hwGpuText.textContent = caps.rendererName
     ? `${backendTag} · ${caps.rendererName}`
     : `${backendTag} · ${t('unknownGpu')}`;
+
+  els.hwRamText.textContent = detectedDeviceMemGB
+    ? t('ramDeviceApprox').replace('{gb}', String(detectedDeviceMemGB))
+    : t('ramDetected');
 
   if (!caps.webgpu && caps.webgl2) {
     els.gpuEngineHint.textContent = t('gpuWebgpuUnavailable');
@@ -534,11 +711,13 @@ function applyLanguage() {
     els.gpuEngineHint.classList.add('hidden');
   }
 
-  if (!state.sessionActive) {
-    updateIdleTimerPreview();
-  } else {
-    tickSessionTimer();
+  if (!ramEngine.running) {
+    els.ramErrorsSub.textContent = t('ramErrorsZero');
   }
+
+  if (!state.sessionActive) updateIdleTimerPreview();
+  else tickSessionTimer();
+
   syncUIState();
 }
 
@@ -547,9 +726,7 @@ function setCpuThreads(value) {
   const clamped = Math.max(1, Math.min(256, Math.round(value) || 1));
   state.cpuThreads = clamped;
   const sliderMax = Number(els.cpuThreadsSlider.max) || 64;
-  if (clamped > sliderMax) {
-    els.cpuThreadsSlider.max = String(clamped);
-  }
+  if (clamped > sliderMax) els.cpuThreadsSlider.max = String(clamped);
   els.cpuThreadsSlider.value = String(clamped);
   els.cpuThreadsInput.value = String(clamped);
   updateSliderFill(els.cpuThreadsSlider);
@@ -557,19 +734,27 @@ function setCpuThreads(value) {
   syncUIState();
 }
 
+function setRamTargetMB(mb) {
+  const clamped = Math.max(256, Math.min(16384, Math.round(mb / 256) * 256));
+  state.ramTargetMB = clamped;
+  els.ramSizeSlider.value = String(clamped);
+  updateSliderFill(els.ramSizeSlider);
+  els.ramSizePresetBtns.forEach((btn) => {
+    btn.classList.toggle('is-active', Number(btn.dataset.mb) === clamped);
+  });
+  ramEngine.updateConfig({ targetMB: clamped });
+  syncUIState();
+}
+
 function wireEvents() {
-  // Language toggle
   els.langToggleBtn.addEventListener('click', () => {
     state.lang = state.lang === 'zh' ? 'en' : 'zh';
     applyLanguage();
   });
 
-  // ESC emergency stop (button + global keyboard)
   els.escStopBtn.addEventListener('click', () => stopAll(false));
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      stopAll(false);
-    }
+    if (e.key === 'Escape') stopAll(false);
   });
 
   // Duration presets
@@ -603,14 +788,14 @@ function wireEvents() {
 
   // Master toggle
   els.masterToggleBtn.addEventListener('click', () => {
-    if (cpuEngine.running || gpuEngine.running) {
+    if (cpuEngine.running || gpuEngine.running || ramEngine.running) {
       stopAll(false);
     } else {
       startAll();
     }
   });
 
-  // CPU toggle & controls
+  // CPU controls
   els.cpuToggleBtn.addEventListener('click', () => {
     if (cpuEngine.running) stopCpu();
     else startCpu();
@@ -619,18 +804,13 @@ function wireEvents() {
   els.cpuThreadsSlider.addEventListener('input', () => {
     setCpuThreads(Number(els.cpuThreadsSlider.value));
   });
-
   els.cpuThreadsInput.addEventListener('change', () => {
     setCpuThreads(Number(els.cpuThreadsInput.value));
   });
-
   els.cpuThreadChips.forEach((chip) => {
     chip.addEventListener('click', () => {
-      if (chip.dataset.abs) {
-        setCpuThreads(Number(chip.dataset.abs));
-      } else if (chip.dataset.mult) {
-        setCpuThreads(Math.round(detectedCores * Number(chip.dataset.mult)));
-      }
+      if (chip.dataset.abs) setCpuThreads(Number(chip.dataset.abs));
+      else if (chip.dataset.mult) setCpuThreads(Math.round(detectedCores * Number(chip.dataset.mult)));
     });
   });
 
@@ -654,7 +834,7 @@ function wireEvents() {
     });
   });
 
-  // GPU toggle & controls
+  // GPU controls
   els.gpuToggleBtn.addEventListener('click', () => {
     if (gpuEngine.running) stopGpu();
     else startGpu();
@@ -699,33 +879,89 @@ function wireEvents() {
     gpuEngine.updateConfig({ uncapVsync: state.gpuUncap });
   });
 
+  els.gpuDualPipeCheckbox.addEventListener('change', () => {
+    state.gpuDualPipe = els.gpuDualPipeCheckbox.checked;
+    gpuEngine.updateConfig({ dualPipeline: state.gpuDualPipe });
+  });
+
+  // RAM controls
+  els.ramToggleBtn.addEventListener('click', () => {
+    if (ramEngine.running) stopRam();
+    else startRam();
+  });
+
+  els.ramSizePresetBtns.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      setRamTargetMB(Number(btn.dataset.mb));
+    });
+  });
+
+  els.ramSizeSlider.addEventListener('input', () => {
+    // Update readout live during drag; commit reallocation on 'change' so we don't churn GBs per pixel
+    const mb = Number(els.ramSizeSlider.value);
+    state.ramTargetMB = mb;
+    updateSliderFill(els.ramSizeSlider);
+    els.ramSizePresetBtns.forEach((btn) => {
+      btn.classList.toggle('is-active', Number(btn.dataset.mb) === mb);
+    });
+    syncUIState();
+  });
+
+  els.ramSizeSlider.addEventListener('change', () => {
+    ramEngine.updateConfig({ targetMB: state.ramTargetMB });
+  });
+
+  els.ramModeBtns.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      els.ramModeBtns.forEach((b) => b.classList.remove('is-active'));
+      btn.classList.add('is-active');
+      state.ramMode = btn.dataset.ramMode;
+      ramEngine.updateConfig({ mode: state.ramMode });
+      syncUIState();
+    });
+  });
+
+  els.ramThreadsSlider.addEventListener('input', () => {
+    state.ramThreads = Number(els.ramThreadsSlider.value);
+    updateSliderFill(els.ramThreadsSlider);
+    syncUIState();
+  });
+
+  els.ramThreadsSlider.addEventListener('change', () => {
+    ramEngine.updateConfig({ threads: state.ramThreads });
+  });
+
   // Summary & error banners
   els.summaryDismissBtn.addEventListener('click', () => {
     els.summaryStrip.classList.add('hidden');
   });
   els.errorDismissBtn.addEventListener('click', hideError);
 
-  // Clean shutdown on page unload
   window.addEventListener('beforeunload', () => {
     cpuEngine.destroy();
     gpuEngine.destroy();
+    ramEngine.destroy();
     releaseWakeLock();
   });
 }
 
 // ==================== Bootstrap ====================
 async function init() {
-  // Configure CPU slider range smartly based on hardwareConcurrency
-  const maxSlider = Math.max(64, detectedCores * 2);
-  els.cpuThreadsSlider.max = String(Math.min(256, maxSlider));
+  const maxCpuSlider = Math.max(64, Math.min(256, detectedCores * 2));
+  els.cpuThreadsSlider.max = String(maxCpuSlider);
   els.cpuThreadsSlider.value = String(detectedCores);
   els.cpuThreadsInput.value = String(detectedCores);
+
+  els.ramThreadsSlider.value = String(state.ramThreads);
+  els.ramSizeSlider.value = String(state.ramTargetMB);
+
   updateSliderFill(els.cpuThreadsSlider);
   updateSliderFill(els.gpuScaleSlider);
+  updateSliderFill(els.ramSizeSlider);
+  updateSliderFill(els.ramThreadsSlider);
 
   wireEvents();
 
-  // Probe GPU capabilities
   const caps = await gpuEngine.init();
   state.gpuEngine = caps.preferredEngine === 'webgpu' ? 'webgpu' : 'webgl2';
 
@@ -749,6 +985,7 @@ async function init() {
 
   applyLanguage();
   cpuSparkline.draw();
+  ramSparkline.draw();
 }
 
 init();
